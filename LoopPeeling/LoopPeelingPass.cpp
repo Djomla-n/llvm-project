@@ -1,3 +1,4 @@
+#include "LoopPeeling.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/LoopPass.h"
@@ -12,7 +13,6 @@ using namespace llvm;
 
 namespace {
 struct LoopPeelingPass : public LoopPass {
-  std::vector<BasicBlock *> LoopBasicBlocks;
   std::unordered_map<Value *, Value *> VariablesMap;
   Value *LoopCounter = nullptr;
   Value *LoopBound = nullptr;
@@ -43,93 +43,119 @@ struct LoopPeelingPass : public LoopPass {
     }
   }
 
-   void duplicateLoopBody(std::vector<BasicBlock *> LoopBodyBasicBlocks, int numOfTimes, BasicBlock *InsertBefore, BasicBlock *Preaheader) {
-        std::unordered_map<Value *, Value *> Mapping;
-        std::unordered_map<Value *, Value *> LoadMapping;
-        std::unordered_map<BasicBlock *, BasicBlock *> BlocksMapping;
-
-        IRBuilder<> Builder(InsertBefore->getContext());
-        Instruction *Copy;
-        BasicBlock *LastFromPreviousCopy = Preaheader;
-        std::vector<BasicBlock *> LoopBodyBasicBlockCopy;
-
-        for (int i = 0; i < numOfTimes; i++) {
-            LoopBodyBasicBlockCopy.clear();
-            Mapping.clear();
-            LoadMapping.clear();
-            BlocksMapping.clear();
-
-            for (size_t j = 0; j < LoopBodyBasicBlocks.size(); j++) {
-                BasicBlock *NewBasicBlock = BasicBlock::Create(InsertBefore->getContext(), "", InsertBefore->getParent(), InsertBefore);
-                LoopBodyBasicBlockCopy.push_back(NewBasicBlock);
-                BlocksMapping[LoopBodyBasicBlocks[j]] = NewBasicBlock;
-            }
-
-            for (size_t j = 0; j < LoopBodyBasicBlocks.size(); j++) {
-                Builder.SetInsertPoint(LoopBodyBasicBlockCopy[j]);
-
-                for (Instruction &I : *LoopBodyBasicBlocks[j]) {
-                    Copy = I.clone();
-                    Builder.Insert(Copy);
-
-                    if (isa<LoadInst>(Copy) && Copy->getOperand(0) == LoopCounter) {
-                        Instruction *Add = (Instruction *) BinaryOperator::CreateAdd(
-                            Copy, ConstantInt::get(Type::getInt32Ty(Copy->getContext()), i));
-                        Add->insertAfter(Copy);
-                        LoadMapping[Copy] = Add;
-                    }
-
-                    Mapping[&I] = Copy;
-
-                    for (size_t k = 0; k < Copy->getNumOperands(); k++) {
-                        if (Mapping.find(Copy->getOperand(k)) != Mapping.end())
-                            Copy->setOperand(k, Mapping[Copy->getOperand(k)]);
-                        if (LoadMapping.find(Copy->getOperand(k)) != LoadMapping.end())
-                            Copy->setOperand(k, LoadMapping[Copy->getOperand(k)]);
-                    }
-                }
-            }
-
-            for (size_t j = 0; j < LoopBodyBasicBlocks.size(); j++) {
-                if (!LoopBodyBasicBlockCopy[j]->getTerminator()) continue;
-                for (size_t k = 0; k < LoopBodyBasicBlockCopy[j]->getTerminator()->getNumSuccessors(); k++) {
-                    BasicBlock *Succ = LoopBodyBasicBlocks[j]->getTerminator()->getSuccessor(k);
-                    if (BlocksMapping.find(Succ) != BlocksMapping.end())
-                        LoopBodyBasicBlockCopy[j]->getTerminator()->setSuccessor(k, BlocksMapping[Succ]);
-                }
-            }
-
-            LastFromPreviousCopy->getTerminator()->setSuccessor(0, LoopBodyBasicBlockCopy.front());
-            LastFromPreviousCopy = LoopBodyBasicBlockCopy.back();
+  Value *getInitialValueFromPreheader(BasicBlock *Preheader) {
+    for (Instruction &I : *Preheader) {
+      if (auto *SI = dyn_cast<StoreInst>(&I)) {
+        if (SI->getPointerOperand() == LoopCounter) {
+          return SI->getValueOperand();
         }
-
-        if (!LoopBodyBasicBlockCopy.empty())
-            LoopBodyBasicBlockCopy.back()->getTerminator()->setSuccessor(0, InsertBefore);
-
-        Builder.SetInsertPoint(LoopBodyBasicBlockCopy.back()->getTerminator());
-        Builder.CreateStore(Builder.getInt32(numOfTimes), LoopCounter);
+      }
     }
 
-  void peelFirstNIterations(Loop *L) {
+    errs() << "Nije pronadjen store za brojac petlje u preheader-u!\n";
+    return nullptr;
+  }
+
+  void peelFirstIteration(Loop *L) {
+    BasicBlock *Header = L->getHeader();
+    Function *F = Header->getParent();
+
     BasicBlock *Preheader = L->getLoopPreheader();
     if (!Preheader) {
-      errs() << "Petlja nema preheader!\n";
+      errs() << "Loop nema preheader!\n";
       return;
     }
 
-    BasicBlock *Header = L->getHeader();
-
-    std::vector<BasicBlock *> LoopBodyBasicBlocks;
-    if (LoopBasicBlocks.size() > 2) {
-      LoopBodyBasicBlocks.resize(LoopBasicBlocks.size() - 2);
-      std::copy(LoopBasicBlocks.begin() + 1, LoopBasicBlocks.end() - 1, LoopBodyBasicBlocks.begin());
+    Value *InitialValue = getInitialValueFromPreheader(Preheader);
+    if (!InitialValue) {
+      return;
     }
-    int numOfTimes = 4;
-    duplicateLoopBody(LoopBodyBasicBlocks, numOfTimes, Header, Preheader);
+
+    std::vector<BasicBlock *> LoopBlocks = L->getBlocks();
+
+    std::unordered_map<BasicBlock *, BasicBlock *> BlockMapping;
+
+    std::unordered_map<Value *, Value *> LoopMapping;
+
+
+    for (BasicBlock *BB : LoopBlocks) {
+      BasicBlock *NewBB = BasicBlock::Create(Header->getContext(), BB->getName() + ".peel", F, Header);
+      BranchInst::Create(Header, NewBB);
+      BlockMapping[BB] = NewBB;
+    }
+
+    for (BasicBlock *BB : LoopBlocks) {
+      BasicBlock *NewBB = BlockMapping[BB];
+
+      std::vector<Instruction *> BlockInstructions;
+      for (Instruction &I : *BB) {
+        if (!I.isTerminator()) {
+          BlockInstructions.push_back(&I);
+        }
+      }
+
+      for (Instruction *Instr : BlockInstructions) {
+        Instruction *Copy = Instr->clone();
+        Copy->insertBefore(NewBB->getTerminator());
+
+        LoopMapping[Instr] = Copy;
+
+        if (isa<LoadInst>(Instr)) {
+          if (Instr->getOperand(0) == LoopCounter) {
+            LoopMapping[Instr] = InitialValue;
+          }
+        }
+
+        for (size_t j = 0; j < Copy->getNumOperands(); j++) {
+          if (LoopMapping[Copy->getOperand(j)]) {
+            Copy->setOperand(j, LoopMapping[Copy->getOperand(j)]);
+          }
+        }
+      }
+
+      Instruction *OldTerminator = BB->getTerminator();
+      Instruction *NewTerminator = OldTerminator->clone();
+      NewTerminator->insertBefore(NewBB->getTerminator());
+      NewBB->getTerminator()->eraseFromParent();
+
+
+      for (unsigned j = 0; j < NewTerminator->getNumOperands(); ++j) {
+        Value *Op = NewTerminator->getOperand(j);
+
+        if (auto *OldTarget = dyn_cast<BasicBlock>(Op)) {
+          if (BlockMapping.count(OldTarget)) {
+            NewTerminator->setOperand(j, BlockMapping[OldTarget]);
+          }
+          continue;
+        }
+
+        if (LoopMapping[Op]) {
+          NewTerminator->setOperand(j, LoopMapping[Op]);
+        }
+      }
+    }
+
+
+    BasicBlock *NewHeader = BlockMapping[Header];
+    for (BasicBlock *BB : LoopBlocks) {
+      BasicBlock *NewBB = BlockMapping[BB];
+      Instruction *Term = NewBB->getTerminator();
+      for (unsigned i = 0; i < Term->getNumSuccessors(); ++i) {
+        if (Term->getSuccessor(i) == NewHeader) {
+          Term->setSuccessor(i, Header);
+        }
+      }
+    }
+
+    Instruction *PreheaderTerm = Preheader->getTerminator();
+    for (unsigned i = 0; i < PreheaderTerm->getNumSuccessors(); ++i) {
+      if (PreheaderTerm->getSuccessor(i) == Header) {
+        PreheaderTerm->setSuccessor(i, NewHeader);
+      }
+    }
   }
 
   bool runOnLoop(Loop *L, LPPassManager &LPM) override {
-    LoopBasicBlocks = L->getBlocksVector();
     mapVariables(L);
     findLoopCounterAndBound(L);
 
@@ -138,8 +164,7 @@ struct LoopPeelingPass : public LoopPass {
       return false;
     }
 
-    peelFirstNIterations(L);
-
+    peelFirstIteration(L);
     return true;
   }
 };
