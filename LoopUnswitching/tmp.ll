@@ -17,7 +17,7 @@ define dso_local i32 @main() #0 {
 
 6:                                                ; preds = %0
   %7 = load i32, ptr %2, align 4
-  %8 = icmp sgt i32 %7, 0 ; pre mapiranja je ovako: %8 = icmp sgt i32 %11, 0
+  %8 = icmp sgt i32 %7, 0 
   br i1 %8, label %9, label %20
 
 9:                                                ; preds = %6, %17
